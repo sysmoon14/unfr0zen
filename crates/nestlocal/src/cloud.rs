@@ -6,6 +6,8 @@
 //!   POST /transport/v?/subscribe  long poll: the device's bucket revisions
 //!                                 in, newer buckets out
 //!   POST /transport/v?/put        the device's changes
+//!   POST /schedules/create        a bucket for one of the device's custom
+//!                                 schedules (hot water)
 //!   GET  /passphrase, /weather/*, /pro_info/*, POST /upload
 //!
 //! Buckets are the cloud's object store: device.<serial>, shared.<serial>,
@@ -238,6 +240,7 @@ impl Cloud {
             "/entry" => self.entry(),
             "/passphrase" => self.reply(&json!({"value": "LOCAL00", "expires": now_ms() + 3_600_000})),
             "/upload" => self.reply(&json!({"status": "ok"})), // logs and diagnostics: dropped
+            "/schedules/create" => self.create_schedule(body),
             _ if path.starts_with("/transport/") => self.transport(path, body),
             _ if path.starts_with("/weather/") => self.weather(uri.query()),
             _ if path.starts_with("/pro_info/") => empty(StatusCode::NOT_FOUND),
@@ -295,6 +298,28 @@ impl Cloud {
             let all: Vec<_> = self.store.all().into_iter().map(|o| (o, false)).collect();
             self.reply_bytes(objects_json(&all))
         }
+    }
+
+    /// nlclient keeps its hot water schedule as a custom schedule, and asks
+    /// the service for a bucket to sync it through before it uploads it:
+    /// {"name":"HOTWATER","mode":"hotwater","is_built_in":true}. nlclient
+    /// takes the reply's bucket_id only with status "success" (else it logs
+    /// msg or error_description as the failure); the name picks the bucket,
+    /// so asking again gets the same one.
+    fn create_schedule(&self, body: &[u8]) -> Response<Body> {
+        let name = decode_object(body).and_then(|b| b.get("name").and_then(Value::as_str).map(str::to_string));
+        let id = name.as_deref().map(|n| n.to_lowercase()).filter(|id| {
+            !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        });
+        let Some(id) = id else {
+            logf!("cloud: schedules/create: no usable name in {}", String::from_utf8_lossy(body));
+            let mut r = self.reply(&json!({"error_description": "expected a schedule name"}));
+            *r.status_mut() = StatusCode::BAD_REQUEST;
+            return r;
+        };
+        let bucket = format!("custom_schedule.{id}");
+        logf!("cloud: custom schedule {:?} syncs through {bucket}", name.unwrap_or_default());
+        self.reply(&json!({"bucket_id": bucket, "status": "success"}))
     }
 
     fn bad_json() -> Response<Body> {
@@ -430,6 +455,20 @@ mod tests {
         let (parts, body) = r.into_parts();
         let bytes = body.collect().await.unwrap().to_bytes();
         (parts.status, parts.headers, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_custom_schedule_gets_a_bucket_named_after_it() {
+        let c = cloud();
+        let body = r#"{"name":"HOTWATER","mode":"hotwater","is_built_in":true}"#;
+        let (status, _, reply) = call(&c, "/schedules/create", body).await;
+        assert_eq!((status, reply.as_str()), (StatusCode::OK, r#"{"bucket_id":"custom_schedule.hotwater","status":"success"}"#));
+        assert_eq!(call(&c, "/schedules/create", body).await.2, reply, "asking again gets the same bucket");
+        for bad in [r#"{"mode":"hotwater"}"#, r#"{"name":"../x"}"#, "not json"] {
+            let (status, _, reply) = call(&c, "/schedules/create", bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+            assert!(reply.contains("error_description"), "{bad}");
+        }
     }
 
     #[tokio::test]
