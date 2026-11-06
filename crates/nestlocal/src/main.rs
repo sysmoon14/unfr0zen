@@ -20,6 +20,7 @@ mod matter;
 mod mqtt;
 mod mqtttls;
 mod nlsettings;
+mod schedule;
 mod store;
 mod settings_ui;
 mod structure;

@@ -73,7 +73,7 @@ impl Bridge {
             Ok(Some(change)) => change,
         };
         let mut changes = vec![(format!("{bucket}.{}", self.serial), fields)];
-        if name == "clear_schedule" {
+        if name == "clear_schedule" || name == "schedule" {
             // Learning off too, or the unit would build a new schedule.
             changes.push((format!("device.{}", self.serial), fields!{"learning_mode" => false}));
         }
@@ -242,6 +242,15 @@ impl Bridge {
 
             // Not a bucket: the unit's clock (clock.rs).
             "time" => self.time_answer(arg).map(|()| None),
+
+            "schedule" => {
+                // Days the command names replace theirs; apply turns learning
+                // off, or the unit would rewrite them.
+                let key = format!("schedule.{}", self.serial);
+                let bucket = self.store.get(&key).map(|o| o.value).unwrap_or_default();
+                let fields = crate::schedule::write(&bucket, arg, now)?;
+                Ok(Some(("schedule".into(), fields)))
+            }
 
             "clear_schedule" => {
                 // Every day empty: the unit keeps whatever setpoint it has
@@ -449,6 +458,20 @@ mod tests {
         assert_eq!(field("hot_water_schedule", "ON", "hot_water_mode"), json!("schedule"));
         assert_eq!(field("hot_water_schedule", "OFF", "hot_water_mode"), json!("off"));
         assert!(b.fields("hot_water_schedule", "maybe").is_err());
+    }
+
+    #[test]
+    fn a_schedule_command_writes_the_week_and_turns_learning_off() {
+        let b = test_bridge();
+        assert!(b.apply("mqtt", "schedule", r#"{"mon": []}"#).is_err(), "wrote a schedule the unit has not reported");
+        b.store.merge("device.S", &fields!{"learning_mode" => true}, 0, 0, true);
+        b.store.merge("schedule.S", &fields!{"schedule_mode" => "HEAT", "days" => json!({})}, 0, 0, true);
+        b.apply("mqtt", "schedule", r#"{"mon": [{"time": "06:30", "temp": 20}]}"#).unwrap();
+        let days = b.store.get("schedule.S").unwrap().value["days"].clone();
+        assert_eq!((&days["0"]["1"]["time"], &days["0"]["1"]["temp"]), (&json!(23400), &json!(20)));
+        assert_eq!(days["3"]["0"]["temp"], json!(20), "every day carries on from Monday's setpoint");
+        assert_eq!(b.store.get("device.S").unwrap().value["learning_mode"], json!(false));
+        assert!(b.apply("mqtt", "schedule", r#"{"mon": [{"time": "06:30", "temp": 99}]}"#).is_err());
     }
 
     #[test]
