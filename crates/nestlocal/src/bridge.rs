@@ -10,6 +10,8 @@
 //!   <prefix>/<serial>/state            the computed state (retained)
 //!   <prefix>/<serial>/raw/<bucket>     each bucket, whole (retained)
 //!   <prefix>/<serial>/schedule         the weekly schedule, by day (retained)
+//!   <prefix>/<serial>/motion           ON at each PIR event (motion.rs)
+//!   <prefix>/<serial>/near             ON at each proximity event
 //!   <prefix>/<serial>/set/<command>    Home Assistant's commands
 //!   <prefix>/<serial>/set/raw/<bucket> merge a JSON object into a bucket
 //!                                      (anything the entities don't cover)
@@ -46,6 +48,7 @@ pub struct Bridge {
     time_asked: Mutex<Option<SystemTime>>, // when ask_time last asked, wall clock
     time_ok: mpsc::Sender<()>,             // Home Assistant answered in time
     time_ok_rx: Mutex<Option<mpsc::Receiver<()>>>,
+    sensors: std::sync::atomic::AtomicBool, // motion.rs follows nlclient's log
 }
 
 impl Bridge {
@@ -65,7 +68,21 @@ impl Bridge {
             time_asked: Mutex::new(None),
             time_ok,
             time_ok_rx: Mutex::new(Some(time_ok_rx)),
+            sensors: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// motion.rs follows the unit's sensor events: announce their sensors.
+    pub fn has_sensors(&self) {
+        self.sensors.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.publish_state();
+    }
+
+    /// A sensor event from motion.rs. Not retained: Home Assistant clears
+    /// the sensor after its hold (off_delay), and an old ON must not come
+    /// back when it restarts.
+    pub fn sensor_event(&self, sensor: crate::motion::Sensor) {
+        self.publish(&format!("{}/{}", self.base, sensor.key()), false, b"ON");
     }
 
     /// Connects to the broker, and from then on publishes every change and
@@ -381,6 +398,15 @@ impl Bridge {
         }
         if truthy(dev.get("has_dehumidifier")) {
             binary("dehumidifier_state", "Dehumidifier", "running", Fields::new());
+        }
+        if self.sensors.load(std::sync::atomic::Ordering::Relaxed) {
+            for sensor in crate::motion::Sensor::ALL {
+                add("binary_sensor", sensor.key(), sensor.name(), fields!{
+                    "state_topic" => format!("{}/{}", self.base, sensor.key()),
+                    "device_class" => sensor.device_class(),
+                    "off_delay" => sensor.hold(),
+                });
+            }
         }
 
         let sw = |add: &mut dyn FnMut(&str, &str, &str, Fields), key: &str, name: &str, icon: &str| {
@@ -771,6 +797,23 @@ pub mod tests {
         assert!(switch_on(&obj(json!({"hot_water_boost_time_to_end": now + 60})), "hot_water_boost"));
         assert!(!switch_on(&obj(json!({"hot_water_mode": "off"})), "hot_water_schedule"));
         assert!(switch_on(&obj(json!({"learning_mode": true})), "learning_mode"));
+    }
+
+    #[test]
+    fn the_motion_sensors_come_with_a_log_to_follow() {
+        let b = test_bridge();
+        let announced = |b: &Bridge| {
+            b.announce(&Fields::new(), &Fields::new());
+            let configs = b.announced.lock().unwrap().clone().unwrap();
+            ["motion", "near"].map(|k| configs.iter().find(|(t, _)| t.contains("binary_sensor") && t.ends_with(&format!("/{k}/config")))
+                .map(|(_, c)| serde_json::from_str::<Value>(c).unwrap()))
+        };
+        assert_eq!(announced(&b), [None, None]);
+        b.has_sensors();
+        let [motion, near] = announced(&b).map(Option::unwrap);
+        assert_eq!((&motion["device_class"], &motion["off_delay"], &motion["state_topic"]),
+                   (&json!("motion"), &json!(30), &json!("nestlocal/S/motion")));
+        assert_eq!((&near["device_class"], &near["off_delay"]), (&json!("occupancy"), &json!(30)));
     }
 
     /// Equipment with everything discovery can announce.

@@ -17,6 +17,7 @@ mod json;
 mod liveness;
 mod logger;
 mod matter;
+mod motion;
 mod mqtt;
 mod mqtttls;
 mod nlsettings;
@@ -144,6 +145,7 @@ async fn run(config: flags::Config) {
         };
         let (broker, tls) = mqtttls::broker(&config.mqtt, config.mqtt_tls, &config.mqtt_ca).unwrap_or_else(|e| fatal!("{e}"));
         bridge.run(&broker, &config.mqtt_user, &password, tls);
+        motion::start(bridge.clone());
         broker_port = Some(broker.port);
     }
     if config.zigbee {
